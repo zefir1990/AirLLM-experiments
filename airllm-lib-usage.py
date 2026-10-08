@@ -8,7 +8,7 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Callable, List, Optional
+from typing import Callable, Iterator, List, Optional, Tuple
 
 from model_catalog import (
     ChatModelOption,
@@ -35,6 +35,63 @@ STOP_SEQUENCES = (
 )
 
 HUGGING_FACE_TOKEN_ENVIRONMENT_VARIABLES = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+
+
+class StopSequenceFilter:
+    def __init__(self, stop_sequences: Tuple[str, ...]) -> None:
+        self._stop_sequences = stop_sequences
+        self._pending_text = ""
+        self._has_stopped = False
+
+    @property
+    def has_stopped(self) -> bool:
+        return self._has_stopped
+
+    def feed(self, text: str) -> str:
+        if self._has_stopped:
+            return ""
+        self._pending_text += text
+        stop_position = self._find_stop_position()
+        if stop_position is not None:
+            return self._stop_at(stop_position)
+        return self._release_safe_prefix()
+
+    def flush(self) -> str:
+        if self._has_stopped:
+            return ""
+        return self._take(len(self._pending_text))
+
+    def _find_stop_position(self) -> Optional[int]:
+        found_positions = [
+            self._pending_text.find(stop_sequence)
+            for stop_sequence in self._stop_sequences
+        ]
+        found_positions = [
+            position for position in found_positions if position != -1
+        ]
+        return min(found_positions) if found_positions else None
+
+    def _stop_at(self, stop_position: int) -> str:
+        self._has_stopped = True
+        return self._take(stop_position)
+
+    def _release_safe_prefix(self) -> str:
+        return self._take(self._safe_length())
+
+    def _safe_length(self) -> int:
+        safe_length = len(self._pending_text)
+        for stop_sequence in self._stop_sequences:
+            for prefix_length in range(1, len(stop_sequence) + 1):
+                if self._pending_text.endswith(stop_sequence[:prefix_length]):
+                    safe_length = min(
+                        safe_length, len(self._pending_text) - prefix_length
+                    )
+        return safe_length
+
+    def _take(self, length: int) -> str:
+        taken_text = self._pending_text[:length]
+        self._pending_text = self._pending_text[length:]
+        return taken_text
 
 
 class ApplicationError(Exception):
@@ -139,15 +196,28 @@ class ChatEngine:
             ) from error
         self._tokenizer = self._model.tokenizer
 
-    def generate(self, messages: List[dict]) -> str:
+    def stream(self, messages: List[dict]) -> Iterator[str]:
         if self._model is None or self._tokenizer is None:
             raise GenerationError("The model is not loaded.")
         prompt = self._compose_prompt(messages)
         try:
-            raw_text = self._generate_text(prompt)
+            yield from self._filtered_stream(prompt)
+        except GenerationError:
+            raise
         except Exception as error:
             raise GenerationError(str(error)) from error
-        return self._strip_stop_sequences(raw_text)
+
+    def _filtered_stream(self, prompt: str) -> Iterator[str]:
+        stop_sequence_filter = StopSequenceFilter(STOP_SEQUENCES)
+        for piece in self._stream_text(prompt):
+            filtered_piece = stop_sequence_filter.feed(piece)
+            if filtered_piece:
+                yield filtered_piece
+            if stop_sequence_filter.has_stopped:
+                return
+        remaining_piece = stop_sequence_filter.flush()
+        if remaining_piece:
+            yield remaining_piece
 
     def _model_kwargs(self) -> dict:
         model_kwargs = {"max_seq_len": self._settings.max_length}
@@ -176,15 +246,6 @@ class ChatEngine:
         return "\n".join(lines)
 
     @staticmethod
-    def _strip_stop_sequences(text: str) -> str:
-        trimmed_text = text
-        for stop_sequence in STOP_SEQUENCES:
-            position = trimmed_text.find(stop_sequence)
-            if position != -1:
-                trimmed_text = trimmed_text[:position]
-        return trimmed_text.strip()
-
-    @staticmethod
     def _hugging_face_token() -> Optional[str]:
         for environment_variable in HUGGING_FACE_TOKEN_ENVIRONMENT_VARIABLES:
             token = os.environ.get(environment_variable)
@@ -192,7 +253,7 @@ class ChatEngine:
                 return token
         return None
 
-    def _generate_text(self, prompt: str) -> str:
+    def _stream_text(self, prompt: str) -> Iterator[str]:
         raise NotImplementedError
 
     def _write(self, message: str) -> None:
@@ -200,7 +261,7 @@ class ChatEngine:
 
 
 class MlxChatEngine(ChatEngine):
-    def _generate_text(self, prompt: str) -> str:
+    def _stream_text(self, prompt: str) -> Iterator[str]:
         import mlx.core as mx
 
         tokenized = self._tokenizer(
@@ -211,11 +272,19 @@ class MlxChatEngine(ChatEngine):
             max_length=self._settings.max_length,
         )
         input_array = mx.array(tokenized["input_ids"])
-        return self._model.generate(
-            input_array,
-            temperature=self._settings.temperature,
-            max_new_tokens=self._settings.max_new_tokens,
-        )
+        generated_token_ids: List[int] = []
+        emitted_text = ""
+        for token in self._model.model_generate(
+            input_array, temperature=self._settings.temperature
+        ):
+            generated_token_ids.append(int(token.item()))
+            full_text = self._tokenizer.decode(generated_token_ids)
+            delta_text = full_text[len(emitted_text) :]
+            emitted_text = full_text
+            if delta_text:
+                yield delta_text
+            if len(generated_token_ids) >= self._settings.max_new_tokens:
+                break
 
 
 class TorchChatEngine(ChatEngine):
@@ -224,7 +293,7 @@ class TorchChatEngine(ChatEngine):
         model_kwargs["device"] = self._device
         return model_kwargs
 
-    def _generate_text(self, prompt: str) -> str:
+    def _stream_text(self, prompt: str) -> Iterator[str]:
         import torch
 
         tokenized = self._tokenizer(
@@ -246,8 +315,18 @@ class TorchChatEngine(ChatEngine):
             generation_kwargs["do_sample"] = False
         with torch.no_grad():
             generated = self._model.generate(input_ids, **generation_kwargs)
-        generated_ids = generated[0][input_ids.shape[1] :]
-        return self._tokenizer.decode(generated_ids, skip_special_tokens=True)
+        generated_token_ids = generated[0][input_ids.shape[1] :].tolist()
+        emitted_text = ""
+        emitted_token_ids: List[int] = []
+        for token_id in generated_token_ids:
+            emitted_token_ids.append(token_id)
+            full_text = self._tokenizer.decode(
+                emitted_token_ids, skip_special_tokens=True
+            )
+            delta_text = full_text[len(emitted_text) :]
+            emitted_text = full_text
+            if delta_text:
+                yield delta_text
 
     @property
     def _device(self) -> str:
@@ -305,19 +384,23 @@ class InteractiveChatSession:
 
     def _respond(self, message: str) -> None:
         self._messages.append({"role": "user", "content": message})
-        self._write("\nGenerating response (this can take a while) ...")
+        self._write("\nAssistant: ")
+        collected_content: List[str] = []
         try:
-            reply = self._chat_engine.generate(self._limited_messages())
+            for content in self._chat_engine.stream(self._limited_messages()):
+                collected_content.append(content)
+                self._write("".join(collected_content))
         except GenerationError as error:
             self._messages.pop()
-            self._write(f"[error] {error}")
+            self._write(f"\n[error] {error}")
             return
         except KeyboardInterrupt:
             self._messages.pop()
             self._write("\n[interrupted]")
             return
-        self._write(f"\nAssistant: {reply}")
-        self._messages.append({"role": "assistant", "content": reply})
+        self._messages.append(
+            {"role": "assistant", "content": "".join(collected_content)}
+        )
 
     def _limited_messages(self) -> List[dict]:
         limited_messages = list(self._messages)
