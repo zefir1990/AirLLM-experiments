@@ -8,10 +8,14 @@ import shlex
 import subprocess
 import sys
 from dataclasses import dataclass
-from enum import Enum
 from typing import Callable, List, Optional
 
-from model_catalog import ChatModelOption, InteractiveModelSelector, ModelCatalog
+from model_catalog import (
+    ChatModelOption,
+    HardwarePlatform,
+    InteractiveModelSelector,
+    ModelCatalog,
+)
 
 DEFAULT_MAX_LENGTH = 2048
 DEFAULT_MAX_NEW_TOKENS = 256
@@ -47,28 +51,6 @@ class ModelLoadingError(ApplicationError):
 
 class GenerationError(ApplicationError):
     pass
-
-
-class HardwarePlatform(Enum):
-    MACOS = "macos"
-    CUDA = "cuda"
-    CPU = "cpu"
-
-    @classmethod
-    def current(cls) -> "HardwarePlatform":
-        if sys.platform == "darwin":
-            return cls.MACOS
-        if cls._is_cuda_available():
-            return cls.CUDA
-        return cls.CPU
-
-    @staticmethod
-    def _is_cuda_available() -> bool:
-        try:
-            import torch
-        except ImportError:
-            return False
-        return torch.cuda.is_available()
 
 
 @dataclass(frozen=True)

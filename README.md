@@ -3,26 +3,32 @@
 Two interactive CLIs for running large language models locally.
 
 - `airllm-openai-server-client.py` installs, launches, and chats with an
-  [airllm-openai-server](https://github.com/mkamranr/airllm-openai-server) running in Docker,
-  through its OpenAI-compatible API.
+  [airllm-openai-server](https://github.com/mkamranr/airllm-openai-server) through its
+  OpenAI-compatible API. It runs the server natively with MLX acceleration on macOS and in
+  Docker elsewhere.
 - `airllm-lib-usage.py` runs the [airllm](https://github.com/lyogavin/airllm) library in-process
   (MLX on macOS, torch elsewhere), with interactive model selection and a chat session.
 
 ## airllm-openai-server-client.py
 
-On first run it configures and launches the server, then opens a streaming chat session
-against the server. On later runs it reuses the existing container.
+On macOS the tool runs the server natively with the MLX backend; on other platforms it builds and
+runs the Docker image. Either way it opens a streaming chat session against the server, and on
+later Docker runs it reuses the existing container.
 
 ### Requirements
 
 - Python 3.7+
-- [Docker](https://docs.docker.com/get-docker/) running locally
+- [Docker](https://docs.docker.com/get-docker/) running locally (non-macOS only)
 - `git` (only needed when the server source must be cloned)
 - Python package `requests`
 
 ```sh
 python3 -m pip install requests
 ```
+
+On macOS, Apple silicon is required. The tool installs `airllm-openai-server[inference,mlx]`
+(including `airllm` and `mlx`) into the current Python environment on first run, so no Docker is
+needed.
 
 ### Usage
 
@@ -32,8 +38,8 @@ python3 airllm-openai-server-client.py
 
 #### First run
 
-The server is not installed, so the tool prompts for the installation settings. Press
-Enter to accept each default:
+On non-macOS the server is not installed, so the tool prompts for the installation settings.
+Press Enter to accept each default:
 
 | Setting          | Default                                              |
 | ---------------- | ---------------------------------------------------- |
@@ -62,10 +68,25 @@ The model is chosen from the shared catalog in `model_catalog.py`, the same list
 
 After the health check passes, the interactive chat starts.
 
+#### macOS
+
+macOS is detected automatically, so Docker is not used. The tool only prompts for the model,
+the host port and (optionally) a HuggingFace token, then installs
+`airllm-openai-server[inference,mlx]` if needed and starts the server with the MLX backend:
+
+```sh
+python3 -m airllm_server --host 127.0.0.1 --port 8000 \
+  --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --backend mlx
+```
+
+Only MLX-compatible (Llama-style) models are offered. The server runs as a child process and is
+stopped when you exit the chat.
+
 #### Later runs
 
 A running container based on the `airllm-server:cpu` image is detected automatically, so
-installation is skipped and the default configuration is reused.
+installation is skipped and the default configuration is reused. The native macOS server is
+restarted on each run.
 
 ## airllm-lib-usage.py
 
@@ -130,6 +151,7 @@ Both tools share the same chat commands:
   seconds per token by design.
 - `airllm-lib-usage.py` stores the Hugging Face download and the layer shards in the standard
   Hugging Face cache (`~/.cache/huggingface`). `airllm-openai-server-client.py` keeps them in
-  the `airllm-cache` Docker volume. Keep these to avoid re-downloading the model on restart.
+  the `airllm-cache` Docker volume on non-macOS and in the standard Hugging Face cache when run
+  natively on macOS. Keep these to avoid re-downloading the model on restart.
 - Gated models (for example `meta-llama/*`) require accepting their terms on Hugging Face and
   providing an access token.

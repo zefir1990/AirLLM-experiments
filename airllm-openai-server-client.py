@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import shlex
@@ -8,12 +9,13 @@ import shutil
 import subprocess
 import sys
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
-from typing import Callable, Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional, Tuple, Union
 
 import requests
 
-from model_catalog import InteractiveModelSelector, ModelCatalog
+from model_catalog import HardwarePlatform, InteractiveModelSelector, ModelCatalog
 
 
 DEFAULT_REPOSITORY_URL = "https://github.com/mkamranr/airllm-openai-server.git"
@@ -29,6 +31,12 @@ DEFAULT_API_KEY = "not-needed"
 DEFAULT_HEALTH_TIMEOUT_SECONDS = 180.0
 DEFAULT_HEALTH_POLL_INTERVAL_SECONDS = 2.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 900.0
+
+DEFAULT_NATIVE_HOST = "127.0.0.1"
+DEFAULT_NATIVE_BACKEND = "mlx"
+NATIVE_SERVER_MODULE = "airllm_server"
+NATIVE_SERVER_PIP_REQUIREMENT = "airllm-openai-server[inference,mlx]"
+NATIVE_SERVER_REQUIRED_IMPORTS = ("airllm_server", "airllm", "mlx")
 
 EXIT_COMMANDS = {"/exit", "/quit", "exit", "quit"}
 
@@ -80,13 +88,17 @@ class CommandExecutor:
             )
         return completed_process
 
+    def start_background(self, arguments: List[str]) -> subprocess.Popen:
+        self._echo(arguments)
+        return subprocess.Popen(arguments)
+
     def _echo(self, arguments: List[str]) -> None:
         pretty_command = " ".join(shlex.quote(argument) for argument in arguments)
         print(f"$ {pretty_command}", file=self._output_stream, flush=True)
 
 
 @dataclass(frozen=True)
-class ServerConfiguration:
+class DockerServerConfiguration:
     repository_url: str
     source_directory: str
     dockerfile_path: str
@@ -103,7 +115,7 @@ class ServerConfiguration:
         return f"http://localhost:{self.host_port}"
 
     @classmethod
-    def with_defaults(cls) -> "ServerConfiguration":
+    def with_defaults(cls) -> "DockerServerConfiguration":
         return cls(
             repository_url=DEFAULT_REPOSITORY_URL,
             source_directory=DEFAULT_SOURCE_DIRECTORY,
@@ -117,7 +129,18 @@ class ServerConfiguration:
         )
 
 
-class InteractiveConfigurator:
+@dataclass(frozen=True)
+class NativeServerConfiguration:
+    model_name: str
+    host_port: int
+    huggingface_token: Optional[str] = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://localhost:{self.host_port}"
+
+
+class ConfigurationPrompter:
     def __init__(
         self,
         input_reader: Callable[[str], str] = input,
@@ -126,38 +149,9 @@ class InteractiveConfigurator:
         self._input_reader = input_reader
         self._output_stream = output_stream
 
-    def configure(self) -> ServerConfiguration:
-        self._write(
-            "\nAirLLM OpenAI server is not installed yet.\n"
-            "Press Enter to accept each default value.\n"
-        )
-        repository_url = self._prompt("Repository URL", DEFAULT_REPOSITORY_URL)
-        source_directory = self._prompt("Source directory", DEFAULT_SOURCE_DIRECTORY)
-        dockerfile_path = self._prompt("Dockerfile path", DEFAULT_DOCKERFILE_PATH)
-        image_tag = self._prompt("Docker image tag", DEFAULT_IMAGE_TAG)
-        container_name = self._prompt("Container name", DEFAULT_CONTAINER_NAME)
-        model_name = self._select_model_name()
-        host_port = self._prompt_integer("Host port", DEFAULT_HOST_PORT)
-        container_port = self._prompt_integer("Container port", DEFAULT_CONTAINER_PORT)
-        volume_name = self._prompt("Cache volume name", DEFAULT_VOLUME_NAME)
-        huggingface_token = self._prompt_optional("HuggingFace token (optional)")
-
-        return ServerConfiguration(
-            repository_url=repository_url,
-            source_directory=source_directory,
-            dockerfile_path=dockerfile_path,
-            image_tag=image_tag,
-            container_name=container_name,
-            model_name=model_name,
-            host_port=host_port,
-            container_port=container_port,
-            volume_name=volume_name,
-            huggingface_token=huggingface_token,
-        )
-
-    def _select_model_name(self) -> str:
+    def _select_model_name(self, catalog: ModelCatalog) -> str:
         return InteractiveModelSelector(
-            ModelCatalog.all_models(),
+            catalog,
             self._input_reader,
             self._output_stream,
         ).select().repository_id
@@ -180,6 +174,54 @@ class InteractiveConfigurator:
 
     def _write(self, message: str) -> None:
         print(message, file=self._output_stream, flush=True)
+
+
+class DockerConfigurator(ConfigurationPrompter):
+    def configure(self) -> DockerServerConfiguration:
+        self._write(
+            "\nAirLLM OpenAI server is not installed yet.\n"
+            "Press Enter to accept each default value.\n"
+        )
+        repository_url = self._prompt("Repository URL", DEFAULT_REPOSITORY_URL)
+        source_directory = self._prompt("Source directory", DEFAULT_SOURCE_DIRECTORY)
+        dockerfile_path = self._prompt("Dockerfile path", DEFAULT_DOCKERFILE_PATH)
+        image_tag = self._prompt("Docker image tag", DEFAULT_IMAGE_TAG)
+        container_name = self._prompt("Container name", DEFAULT_CONTAINER_NAME)
+        model_name = self._select_model_name(ModelCatalog.all_models())
+        host_port = self._prompt_integer("Host port", DEFAULT_HOST_PORT)
+        container_port = self._prompt_integer("Container port", DEFAULT_CONTAINER_PORT)
+        volume_name = self._prompt("Cache volume name", DEFAULT_VOLUME_NAME)
+        huggingface_token = self._prompt_optional("HuggingFace token (optional)")
+
+        return DockerServerConfiguration(
+            repository_url=repository_url,
+            source_directory=source_directory,
+            dockerfile_path=dockerfile_path,
+            image_tag=image_tag,
+            container_name=container_name,
+            model_name=model_name,
+            host_port=host_port,
+            container_port=container_port,
+            volume_name=volume_name,
+            huggingface_token=huggingface_token,
+        )
+
+
+class NativeConfigurator(ConfigurationPrompter):
+    def configure(self) -> NativeServerConfiguration:
+        self._write(
+            "\nmacOS detected: the AirLLM server runs natively with MLX acceleration.\n"
+            "Press Enter to accept each default value.\n"
+        )
+        model_name = self._select_model_name(ModelCatalog.mlx_compatible_models())
+        host_port = self._prompt_integer("Host port", DEFAULT_HOST_PORT)
+        huggingface_token = self._prompt_optional("HuggingFace token (optional)")
+
+        return NativeServerConfiguration(
+            model_name=model_name,
+            host_port=host_port,
+            huggingface_token=huggingface_token,
+        )
 
 
 class DockerCli:
@@ -231,7 +273,7 @@ class DockerCli:
             return []
         return completed_process.stdout.split()
 
-    def build_image(self, configuration: ServerConfiguration) -> None:
+    def build_image(self, configuration: DockerServerConfiguration) -> None:
         self._command_executor.run_checked(
             [
                 "docker",
@@ -245,7 +287,7 @@ class DockerCli:
             working_directory=configuration.source_directory,
         )
 
-    def run_container(self, configuration: ServerConfiguration) -> None:
+    def run_container(self, configuration: DockerServerConfiguration) -> None:
         arguments = [
             "docker",
             "run",
@@ -276,7 +318,7 @@ class SourceRepository:
     def __init__(self, command_executor: CommandExecutor) -> None:
         self._command_executor = command_executor
 
-    def ensure_available(self, configuration: ServerConfiguration) -> None:
+    def ensure_available(self, configuration: DockerServerConfiguration) -> None:
         if os.path.isdir(configuration.source_directory):
             return
         if shutil.which("git") is None:
@@ -295,12 +337,24 @@ class SourceRepository:
         )
 
 
-class ServerProvisioner:
+class ServerLauncher(ABC):
+    @abstractmethod
+    def ensure_running(self) -> None:
+        raise NotImplementedError
+
+    def is_alive(self) -> bool:
+        return True
+
+    def stop(self) -> None:
+        pass
+
+
+class DockerServerLauncher(ServerLauncher):
     def __init__(
         self,
         docker_cli: DockerCli,
         source_repository: SourceRepository,
-        configuration: ServerConfiguration,
+        configuration: DockerServerConfiguration,
         output_stream: object = sys.stdout,
     ) -> None:
         self._docker_cli = docker_cli
@@ -308,7 +362,7 @@ class ServerProvisioner:
         self._configuration = configuration
         self._output_stream = output_stream
 
-    def ensure_installed_and_running(self) -> None:
+    def ensure_running(self) -> None:
         self._docker_cli.ensure_available()
 
         container_name = self._configuration.container_name
@@ -335,6 +389,86 @@ class ServerProvisioner:
         print(message, file=self._output_stream, flush=True)
 
 
+class NativeServerLauncher(ServerLauncher):
+    def __init__(
+        self,
+        command_executor: CommandExecutor,
+        configuration: NativeServerConfiguration,
+        output_stream: object = sys.stdout,
+    ) -> None:
+        self._command_executor = command_executor
+        self._configuration = configuration
+        self._output_stream = output_stream
+        self._process: Optional[subprocess.Popen] = None
+
+    def ensure_running(self) -> None:
+        self._ensure_dependencies_installed()
+        self._start_server()
+
+    def is_alive(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    def stop(self) -> None:
+        if self._process is None:
+            return
+        self._process.terminate()
+        try:
+            self._process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+        finally:
+            self._process = None
+
+    def _ensure_dependencies_installed(self) -> None:
+        if all(self._is_importable(name) for name in NATIVE_SERVER_REQUIRED_IMPORTS):
+            return
+        self._write("Installing airllm-openai-server with MLX support.")
+        if self._run_install(use_user_site=False) != 0:
+            if self._run_install(use_user_site=True) != 0:
+                raise InstallationError(
+                    f"Failed to install '{NATIVE_SERVER_PIP_REQUIREMENT}'."
+                )
+        importlib.invalidate_caches()
+
+    def _run_install(self, use_user_site: bool) -> int:
+        arguments = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            NATIVE_SERVER_PIP_REQUIREMENT,
+        ]
+        if use_user_site:
+            arguments.append("--user")
+        return self._command_executor.run(arguments).returncode
+
+    def _start_server(self) -> None:
+        arguments = [
+            sys.executable,
+            "-m",
+            NATIVE_SERVER_MODULE,
+            "--host",
+            DEFAULT_NATIVE_HOST,
+            "--port",
+            str(self._configuration.host_port),
+            "--model",
+            self._configuration.model_name,
+            "--backend",
+            DEFAULT_NATIVE_BACKEND,
+        ]
+        if self._configuration.huggingface_token:
+            arguments.extend(["--hf-token", self._configuration.huggingface_token])
+        self._process = self._command_executor.start_background(arguments)
+
+    @staticmethod
+    def _is_importable(import_name: str) -> bool:
+        return importlib.util.find_spec(import_name) is not None
+
+    def _write(self, message: str) -> None:
+        print(message, file=self._output_stream, flush=True)
+
+
 class ServerHealthWaiter:
     def __init__(
         self,
@@ -342,11 +476,13 @@ class ServerHealthWaiter:
         timeout_seconds: float = DEFAULT_HEALTH_TIMEOUT_SECONDS,
         poll_interval_seconds: float = DEFAULT_HEALTH_POLL_INTERVAL_SECONDS,
         output_stream: object = sys.stdout,
+        is_server_process_alive: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout_seconds = timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
         self._output_stream = output_stream
+        self._is_server_process_alive = is_server_process_alive
 
     def wait_until_ready(self) -> None:
         health_url = f"{self._base_url}/health"
@@ -356,6 +492,8 @@ class ServerHealthWaiter:
             if self._is_healthy(health_url):
                 self._write("Server is ready.")
                 return
+            if self._is_server_process_alive is not None and not self._is_server_process_alive():
+                raise ApplicationError("The server process exited before becoming ready.")
             time.sleep(self._poll_interval_seconds)
         raise ApplicationError(
             f"Server did not become ready within {self._timeout_seconds:.0f} seconds."
@@ -570,18 +708,46 @@ class Application:
         self._docker_cli = DockerCli(self._command_executor)
 
     def run(self) -> None:
-        self._docker_cli.ensure_available()
-        configuration = self._resolve_configuration()
-        provisioner = ServerProvisioner(
+        launcher, configuration = self._prepare_launcher()
+        launcher.ensure_running()
+        try:
+            self._run_chat_session(configuration, launcher)
+        finally:
+            launcher.stop()
+
+    def _prepare_launcher(
+        self,
+    ) -> Tuple[ServerLauncher, Union[DockerServerConfiguration, NativeServerConfiguration]]:
+        if HardwarePlatform.current() is HardwarePlatform.MACOS:
+            configuration = NativeConfigurator(
+                output_stream=self._output_stream
+            ).configure()
+            launcher = NativeServerLauncher(
+                self._command_executor,
+                configuration,
+                self._output_stream,
+            )
+            return launcher, configuration
+
+        configuration = self._resolve_docker_configuration()
+        launcher = DockerServerLauncher(
             self._docker_cli,
             SourceRepository(self._command_executor),
             configuration,
             self._output_stream,
         )
-        provisioner.ensure_installed_and_running()
+        return launcher, configuration
 
-        ServerHealthWaiter(configuration.base_url, output_stream=self._output_stream).wait_until_ready()
-
+    def _run_chat_session(
+        self,
+        configuration: Union[DockerServerConfiguration, NativeServerConfiguration],
+        launcher: ServerLauncher,
+    ) -> None:
+        ServerHealthWaiter(
+            configuration.base_url,
+            output_stream=self._output_stream,
+            is_server_process_alive=launcher.is_alive,
+        ).wait_until_ready()
         chat_client = OpenAiCompatibleChatClient(
             configuration.base_url,
             configured_model_name=configuration.model_name,
@@ -593,8 +759,8 @@ class Application:
             output_stream=self._output_stream,
         ).run()
 
-    def _resolve_configuration(self) -> ServerConfiguration:
-        default_configuration = ServerConfiguration.with_defaults()
+    def _resolve_docker_configuration(self) -> DockerServerConfiguration:
+        default_configuration = DockerServerConfiguration.with_defaults()
         existing_container_name = self._find_existing_container_name(default_configuration)
         if existing_container_name is not None:
             print(
@@ -604,10 +770,10 @@ class Application:
                 flush=True,
             )
             return replace(default_configuration, container_name=existing_container_name)
-        return InteractiveConfigurator(output_stream=self._output_stream).configure()
+        return DockerConfigurator(output_stream=self._output_stream).configure()
 
     def _find_existing_container_name(
-        self, default_configuration: ServerConfiguration
+        self, default_configuration: DockerServerConfiguration
     ) -> Optional[str]:
         if self._docker_cli.container_exists(DEFAULT_CONTAINER_NAME):
             return DEFAULT_CONTAINER_NAME

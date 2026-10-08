@@ -2,7 +2,30 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, List, Optional
+
+
+class HardwarePlatform(Enum):
+    MACOS = "macos"
+    CUDA = "cuda"
+    CPU = "cpu"
+
+    @classmethod
+    def current(cls) -> "HardwarePlatform":
+        if sys.platform == "darwin":
+            return cls.MACOS
+        if cls._is_cuda_available():
+            return cls.CUDA
+        return cls.CPU
+
+    @staticmethod
+    def _is_cuda_available() -> bool:
+        try:
+            import torch
+        except ImportError:
+            return False
+        return torch.cuda.is_available()
 
 
 @dataclass(frozen=True)
