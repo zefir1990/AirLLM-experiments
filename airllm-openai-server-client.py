@@ -13,13 +13,15 @@ from typing import Callable, Iterator, List, Optional
 
 import requests
 
+from model_catalog import InteractiveModelSelector, ModelCatalog
+
 
 DEFAULT_REPOSITORY_URL = "https://github.com/mkamranr/airllm-openai-server.git"
 DEFAULT_SOURCE_DIRECTORY = "airllm-openai-server"
 DEFAULT_DOCKERFILE_PATH = "docker/Dockerfile"
 DEFAULT_IMAGE_TAG = "airllm-server:cpu"
 DEFAULT_CONTAINER_NAME = "airllm-server"
-DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+DEFAULT_MODEL_NAME = ModelCatalog.all_models().default_option.repository_id
 DEFAULT_HOST_PORT = 8000
 DEFAULT_CONTAINER_PORT = 8000
 DEFAULT_VOLUME_NAME = "airllm-cache"
@@ -134,7 +136,7 @@ class InteractiveConfigurator:
         dockerfile_path = self._prompt("Dockerfile path", DEFAULT_DOCKERFILE_PATH)
         image_tag = self._prompt("Docker image tag", DEFAULT_IMAGE_TAG)
         container_name = self._prompt("Container name", DEFAULT_CONTAINER_NAME)
-        model_name = self._prompt("Model name", DEFAULT_MODEL_NAME)
+        model_name = self._select_model_name()
         host_port = self._prompt_integer("Host port", DEFAULT_HOST_PORT)
         container_port = self._prompt_integer("Container port", DEFAULT_CONTAINER_PORT)
         volume_name = self._prompt("Cache volume name", DEFAULT_VOLUME_NAME)
@@ -152,6 +154,13 @@ class InteractiveConfigurator:
             volume_name=volume_name,
             huggingface_token=huggingface_token,
         )
+
+    def _select_model_name(self) -> str:
+        return InteractiveModelSelector(
+            ModelCatalog.all_models(),
+            self._input_reader,
+            self._output_stream,
+        ).select().repository_id
 
     def _prompt(self, label: str, default: str) -> str:
         raw_value = self._input_reader(f"{label} [{default}]: ").strip()
@@ -520,6 +529,15 @@ class InteractiveChatSession:
             self._messages.pop()
             self._write(f"\n[error] {error}")
             return
+        except KeyboardInterrupt:
+            self._write("\n[interrupted]")
+            if collected_content:
+                self._messages.append(
+                    {"role": "assistant", "content": "".join(collected_content)}
+                )
+            else:
+                self._messages.pop()
+            return
         self._write("")
         self._messages.append(
             {"role": "assistant", "content": "".join(collected_content)}
@@ -529,7 +547,7 @@ class InteractiveChatSession:
         self._write(
             f"Connected to model: {self._model_name}\n"
             "The first reply may take minutes while the model is downloaded and split.\n"
-            "Type /help for commands."
+            "Type /help for commands, or press Ctrl+C to interrupt a response."
         )
 
     def _print_help(self) -> None:
@@ -537,7 +555,8 @@ class InteractiveChatSession:
             "Commands:\n"
             "  /help   Show this help\n"
             "  /clear  Clear the conversation history\n"
-            "  /exit   Leave the chat"
+            "  /exit   Leave the chat\n"
+            "  Ctrl+C  Interrupt a response"
         )
 
     def _write(self, text: str, end: str = "\n") -> None:
@@ -603,7 +622,7 @@ def main() -> int:
         print(f"Error: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print(file=sys.stderr)
+        print("Interrupted.", file=sys.stderr)
         return 130
     return 0
 

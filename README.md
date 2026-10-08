@@ -1,12 +1,19 @@
 # AirLLM experiments
 
-Interactive CLI that installs and chats with an
-[airllm-openai-server](https://github.com/mkamranr/airllm-openai-server) running in Docker.
+Two interactive CLIs for running large language models locally.
+
+- `airllm-openai-server-client.py` installs, launches, and chats with an
+  [airllm-openai-server](https://github.com/mkamranr/airllm-openai-server) running in Docker,
+  through its OpenAI-compatible API.
+- `airllm-lib-usage.py` runs the [airllm](https://github.com/lyogavin/airllm) library in-process
+  (MLX on macOS, torch elsewhere), with interactive model selection and a chat session.
+
+## airllm-openai-server-client.py
 
 On first run it configures and launches the server, then opens a streaming chat session
-against its OpenAI-compatible API. On later runs it reuses the existing container.
+against the server. On later runs it reuses the existing container.
 
-## Requirements
+### Requirements
 
 - Python 3.7+
 - [Docker](https://docs.docker.com/get-docker/) running locally
@@ -17,13 +24,13 @@ against its OpenAI-compatible API. On later runs it reuses the existing containe
 python3 -m pip install requests
 ```
 
-## Usage
+### Usage
 
 ```sh
-python3 main.py
+python3 airllm-openai-server-client.py
 ```
 
-### First run
+#### First run
 
 The server is not installed, so the tool prompts for the installation settings. Press
 Enter to accept each default:
@@ -50,29 +57,79 @@ docker run -d -p 8000:8000 -v airllm-cache:/cache \
   -e AIRLLM_MODEL=Qwen/Qwen2.5-0.5B-Instruct airllm-server:cpu
 ```
 
+The model is chosen from the shared catalog in `model_catalog.py`, the same list used by
+`airllm-lib-usage.py`.
+
 After the health check passes, the interactive chat starts.
 
-### Later runs
+#### Later runs
 
-An existing `airllm-server` container is detected automatically, so installation is
-skipped and the default configuration is reused.
+A running container based on the `airllm-server:cpu` image is detected automatically, so
+installation is skipped and the default configuration is reused.
 
-### Chat commands
+## airllm-lib-usage.py
 
-| Command  | Action                       |
-| -------- | ---------------------------- |
-| `/help`  | Show available commands      |
-| `/clear` | Clear the conversation       |
-| `/exit`  | Leave the chat (or `/quit`)  |
+Runs AirLLM directly in the current Python process, without Docker.
 
-`Ctrl+D` or `Ctrl+C` also exits.
+### Requirements
+
+- Python 3.9+
+- `pip` (missing dependencies are installed on demand)
+- macOS: Apple silicon, using AirLLM's MLX runtime
+- Other platforms: CUDA or CPU, using AirLLM's torch runtime
+- A Hugging Face access token for gated models
+
+### Usage
+
+```sh
+python3 airllm-lib-usage.py
+```
+
+The tool then:
+
+1. Shows a numbered list of models (enter a number, a repository id, or an empty line for the
+   default).
+2. Installs `airllm` (and `mlx` on macOS) if they are missing.
+3. Loads the selected model and opens a chat session.
+
+On the first load AirLLM downloads the model and splits it into layer shards, which can take
+a long time.
+
+#### Gated models
+
+Set `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) before starting when using gated models:
+
+```sh
+export HF_TOKEN=hf_...
+python3 airllm-lib-usage.py
+```
+
+#### macOS
+
+AirLLM's macOS runtime uses its MLX Llama implementation, which only supports Llama-style
+architectures (no attention bias, untied embeddings). Qwen and similar models are therefore
+only offered on non-macOS platforms.
+
+## Chat commands
+
+Both tools share the same chat commands:
+
+| Command  | Action                                                    |
+| -------- | --------------------------------------------------------- |
+| `/help`  | Show available commands                                   |
+| `/clear` | Clear the conversation                                    |
+| `/exit`  | Leave the chat (or `/quit`)                               |
+| `Ctrl+C` | Interrupt a response; press again at the prompt to exit   |
+
+`Ctrl+D` also exits.
 
 ## Notes
 
 - The first reply can take minutes: AirLLM downloads the model and splits it into layer
   shards before generating. It reads every layer from disk per token, so throughput is
   seconds per token by design.
-- The `airllm-cache` volume holds both the HuggingFace cache and the layer shards.
-  Keep it to avoid re-downloading the model on every restart.
-- Gated models (for example `meta-llama/*`) require accepting their terms on Hugging
-  Face and providing an `HF_TOKEN`.
+- `airllm-lib-usage.py` stores the Hugging Face download and the layer shards in the standard
+  Hugging Face cache (`~/.cache/huggingface`). `airllm-openai-server-client.py` keeps them in
+  the `airllm-cache` Docker volume. Keep these to avoid re-downloading the model on restart.
+- Gated models (for example `meta-llama/*`) require accepting their terms on Hugging Face and
+  providing an access token.
